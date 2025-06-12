@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+import concurrent.futures
+from typing import List, Dict, Any
 
 load_dotenv()
 
@@ -13,7 +15,6 @@ app = Flask(__name__)
 
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 MCP_SERVER_URL = os.getenv('MCP_SERVER_URL')
-
 
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable is required")
@@ -37,23 +38,19 @@ class MCPManager:
                 self.available_tools = []
                 
                 for tool in tools:
-                   
                     tool_schema = getattr(tool, 'inputSchema', None)
                     
                     if tool_schema and hasattr(tool_schema, 'get'):
-                        
                         properties = tool_schema.get('properties', {})
                         required = tool_schema.get('required', [])
                     else:
-                       
                         properties = {}
                         required = []
                     
-                   
                     if 'instructions' in required:
                         required = [r for r in required if r != 'instructions']
                     
-                    # chatcompletioon required format
+                    # ChatCompletion required format
                     tool_definition = {
                         "type": "function",
                         "function": {
@@ -74,12 +71,10 @@ class MCPManager:
             print(f"Error fetching tools: {e}")
             return []
     
-    async def execute_tool(self, tool_name, parameters):
+    async def execute_tool(self, tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a specific tool with given parameters"""
         try:
             async with self.client:
-              
-            #  use **unpacking ones as to append new parameters and convert into in dict
                 mcp_parameters = {
                     "instructions": f"Execute the {tool_name} tool with the following parameters",
                     **parameters  
@@ -99,8 +94,50 @@ class MCPManager:
         except Exception as e:
             print(f"Error executing tool {tool_name}: {e}")
             return {"error": f"Failed to execute {tool_name}: {str(e)}"}
+    
+    async def execute_tools_concurrently(self, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Execute multiple tools concurrently"""
+        tasks = []
+        
+        for tool_call in tool_calls:
+            function_name = tool_call['function']['name']
+            function_args = json.loads(tool_call['function']['arguments'])
+            
+            # Create async task for each tool execution
+            task = asyncio.create_task(
+                self.execute_tool(function_name, function_args)
+            )
+            tasks.append({
+                'task': task,
+                'tool_call': tool_call,
+                'function_name': function_name,
+                'function_args': function_args
+            })
+        
+        # Wait for all tasks to complete
+        results = []
+        for task_info in tasks:
+            try:
+                result = await task_info['task']
+                results.append({
+                    'tool_call_id': task_info['tool_call']['id'],
+                    'function_name': task_info['function_name'],
+                    'function_args': task_info['function_args'],
+                    'result': result,
+                    'success': True
+                })
+            except Exception as e:
+                results.append({
+                    'tool_call_id': task_info['tool_call']['id'],
+                    'function_name': task_info['function_name'],
+                    'function_args': task_info['function_args'],
+                    'result': {"error": f"Failed to execute {task_info['function_name']}: {str(e)}"},
+                    'success': False
+                })
+        
+        return results
 
-# Initialize MCP Manager - can further optimized even when using more than one MCP server.
+# Initialize MCP Manager
 mcp_manager = MCPManager(MCP_SERVER_URL)
 
 def run_async(coro):
@@ -117,9 +154,8 @@ def chat():
     try:
         # Get user message from request
         data = request.get_json()
-        user_message = data.get('message', '')
         
-        if not user_message:
+        if not data:
             return jsonify({"error": "No message provided"}), 400
         
         # Step 1: Get available tools from MCP server
@@ -127,73 +163,98 @@ def chat():
         
         # Step 2: Prepare chat completion with function calling
         messages = [
-            {"role": "system", "content": "You are a helpful assistant that can use various tools to help users. When a user asks for something that matches available tools, use the appropriate function. Always provide clear, friendly responses with proper formatting. If you create or access any links, format them as clickable markdown links."},
-            {"role": "user", "content": user_message}
+            {"role": "system", "content": "You are a helpful assistant that can use various tools to help users. When a user asks for something that requires multiple tools, you can call multiple functions simultaneously. Always provide clear, friendly responses with proper formatting. If you create or access any links, format them as clickable markdown links."}
         ]
+        messages.extend(data)
         
         # Step 3: Call OpenAI Chat Completion with functions
         if available_tools:
             response = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4o-mini",
                 messages=messages,
                 tools=available_tools,
                 tool_choice="auto"
             )
         else:
             response = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4o-mini",
                 messages=messages
             )
         
         assistant_message = response.choices[0].message
         
-        # Step 4: Check if tool was called
+        # Step 4: Check if tools were called
         if assistant_message.tool_calls:
-            tool_call = assistant_message.tool_calls[0]
-            function_name = tool_call.function.name
-            function_args = json.loads(tool_call.function.arguments)
+            print(f"Number of tool calls: {len(assistant_message.tool_calls)}")
             
-            print(f"Executing tool: {function_name}")
-            print(f"Arguments: {function_args}")
+            # Convert tool calls to list of dictionaries for processing
+            tool_calls_list = []
+            for tool_call in assistant_message.tool_calls:
+                tool_calls_list.append({
+                    'id': tool_call.id,
+                    'type': tool_call.type,
+                    'function': {
+                        'name': tool_call.function.name,
+                        'arguments': tool_call.function.arguments
+                    }
+                })
+                print(f"Tool call: {tool_call.function.name} with args: {tool_call.function.arguments}")
             
-            # Step 5: Execute the MCP tool
-            tool_result = run_async(mcp_manager.execute_tool(function_name, function_args))
+            # Step 5: Execute all tools concurrently
+            tool_results = run_async(mcp_manager.execute_tools_concurrently(tool_calls_list))
             
-            # Step 6: Send tool result back to OpenAI for final response with enhanced formatting
+            # Step 6: Add assistant message with tool calls to conversation
             messages.append({
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [{
-                    "id": tool_call.id,
-                    "type": "function",
-                    "function": {
-                        "name": function_name,
-                        "arguments": tool_call.function.arguments
-                    }
-                }]
-            })
-            # to remeber context used before 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": json.dumps(tool_result) #serialization is needed to obj->str
+                "tool_calls": [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": tool_call.function.arguments
+                        }
+                    } for tool_call in assistant_message.tool_calls
+                ]
             })
             
-            # displaying finall result in good format , need to instruct gpt.(just guiding gpt)
+            # Step 7: Add tool results to conversation
+            for result_info in tool_results:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": result_info['tool_call_id'],
+                    "content": json.dumps(result_info['result'])
+                })
+                
+                if result_info['success']:
+                    print(f"✓ {result_info['function_name']} executed successfully")
+                else:
+                    print(f"✗ {result_info['function_name']} failed: {result_info['result']}")
+            
+            # Step 8: Add formatting instructions
             messages.append({
                 "role": "system",
-                "content": "Format your response in a user-friendly way. If there are any URLs in the tool result, format them as clickable markdown links. Provide a clear, concise summary of what was accomplished. Don't show raw JSON or technical details unless specifically requested."
+                "content": "Format your response in a user-friendly way. If there are any URLs in the tool results, format them as clickable markdown links. Provide a clear, concise summary of what was accomplished with each tool. If multiple tools were executed, organize the results clearly. Don't show raw JSON or technical details unless specifically requested."
             })
             
-            # Get final response from OpenAI (displayingg)
+            # Step 9: Get final response from OpenAI
             final_response = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4o-mini",
                 messages=messages
             )
             
-            # Return only the beautified response
+            # Return the formatted response with execution summary
+            execution_summary = {
+                "tools_executed": len(tool_results),
+                "successful_executions": sum(1 for r in tool_results if r['success']),
+                "failed_executions": sum(1 for r in tool_results if not r['success']),
+                "concurrent_execution": len(tool_results) > 1
+            }
+            
             return jsonify({
-                "response": final_response.choices[0].message.content
+                "response": final_response.choices[0].message.content,
+                "execution_summary": execution_summary
             })
         
         else:
@@ -203,6 +264,7 @@ def chat():
             })
     
     except Exception as e:
+        print(f"Error in chat endpoint: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/tools', methods=['GET'])
@@ -217,9 +279,21 @@ def get_tools():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "mcp_server_url": MCP_SERVER_URL,
+        "tools_available": len(mcp_manager.available_tools)
+    })
+
 if __name__ == '__main__':
-    
     port = int(os.getenv('PORT', 5000))
     debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    
+    print(f"Starting Flask app on port {port}")
+    print(f"MCP Server URL: {MCP_SERVER_URL}")
+    print(f"Debug mode: {debug_mode}")
     
     app.run(debug=debug_mode, host='0.0.0.0', port=port)
